@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // CLI entry: parse flags, then hand the remaining argv off to run().
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, createWriteStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { run } from '../src/run.js';
@@ -15,12 +15,21 @@ Options:
   --quiet              suppress the periodic status line (the final summary still prints)
   --interval ms        minimum ms between status-line writes when stderr is not a TTY (default 5000)
   --history FILE|off   history file path, or "off" to disable history for this run
+  --status-file FILE   write the status line / --json events to FILE instead of stderr,
+                        so stderr carries only the wrapped command's own bytes
+  --status-fd N        like --status-file, but write to an already-open file descriptor N
   --experimental       reserved for bare-number inference (not implemented yet)
-  --total N            force the primary counter's total to N
-  --label NAME         only track counters labeled NAME
+  --total N            force the primary counter's total to N (must be > 0)
+  --label NAME         only track counters labeled NAME (case-insensitive)
   --ascii              draw the progress bar with plain ASCII characters
   --version             print the version and exit
   --help                print this help and exit
+
+By default the status line, --json events, and the wrapped command's own
+stderr all share stderr, interleaved - so stderr alone is not a byte-exact
+copy of what the command would have printed on its own (stdout always is).
+Use --status-file or --status-fd for a run where stderr is guaranteed to be
+nothing but the command's own bytes.
 `;
 
 function usageError(message) {
@@ -61,7 +70,7 @@ function parseArgs(argv) {
         break;
       case '--interval': {
         const value = Number(argv[i + 1]);
-        if (!Number.isFinite(value)) return { error: '--interval requires a numeric ms value' };
+        if (!Number.isFinite(value) || value < 0) return { error: '--interval requires a non-negative numeric ms value' };
         opts.intervalMs = value;
         i += 1;
         break;
@@ -73,9 +82,25 @@ function parseArgs(argv) {
         i += 1;
         break;
       }
+      case '--status-file': {
+        const value = argv[i + 1];
+        if (value === undefined) return { error: '--status-file requires a FILE path' };
+        if (opts.statusFd !== undefined) return { error: '--status-file and --status-fd cannot both be given' };
+        opts.statusFile = value;
+        i += 1;
+        break;
+      }
+      case '--status-fd': {
+        const value = Number(argv[i + 1]);
+        if (!Number.isInteger(value) || value < 0) return { error: '--status-fd requires a non-negative integer file descriptor' };
+        if (opts.statusFile !== undefined) return { error: '--status-file and --status-fd cannot both be given' };
+        opts.statusFd = value;
+        i += 1;
+        break;
+      }
       case '--total': {
         const value = Number(argv[i + 1]);
-        if (!Number.isFinite(value)) return { error: '--total requires a numeric value' };
+        if (!Number.isFinite(value) || value <= 0) return { error: '--total requires a positive numeric value' };
         opts.total = value;
         i += 1;
         break;
@@ -83,7 +108,7 @@ function parseArgs(argv) {
       case '--label': {
         const value = argv[i + 1];
         if (value === undefined) return { error: '--label requires a NAME' };
-        opts.label = value;
+        opts.label = value.toLowerCase(); // parsed labels are always lowercased; match that here
         i += 1;
         break;
       }
@@ -122,6 +147,26 @@ async function main() {
   }
   if (opts.experimental) {
     process.stderr.write('nigh: warning: --experimental bare-counter mode is not implemented yet; ignoring.\n');
+  }
+
+  if (opts.statusFile !== undefined) {
+    try {
+      mkdirSync(path.dirname(opts.statusFile), { recursive: true });
+      opts.statusStream = createWriteStream(opts.statusFile);
+    } catch (err) {
+      process.stderr.write(`nigh: could not open --status-file ${opts.statusFile}: ${err && err.message ? err.message : err}\n`);
+      process.exitCode = 2;
+      return;
+    }
+  } else if (opts.statusFd !== undefined) {
+    try {
+      // autoClose: false - this fd was handed to us open; it is not ours to close.
+      opts.statusStream = createWriteStream('', { fd: opts.statusFd, autoClose: false });
+    } catch (err) {
+      process.stderr.write(`nigh: could not open --status-fd ${opts.statusFd}: ${err && err.message ? err.message : err}\n`);
+      process.exitCode = 2;
+      return;
+    }
   }
 
   try {

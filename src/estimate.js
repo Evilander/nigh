@@ -6,6 +6,15 @@ const MIN_OVERALL_SPAN_SECONDS = 0.25;
 const BLEND_THRESHOLD = 0.15;
 const RECENT_WEIGHT = 0.6;
 const MIN_BAND_PAD = 0.1;
+// A signal's own typical gap between samples, floored so a slow-but-healthy
+// counter (one sample every 30s) does not get flagged just for normal pacing.
+const STALL_MIN_GAP_MS = 2000;
+// Silence past this many typical gaps: still project from the last known
+// rate, but widen the band to admit it might be slowing down.
+const STALL_WIDEN_FACTOR = 4;
+// Silence past this many typical gaps: the last known rate no longer means
+// anything worth projecting forward; stop claiming a live estimate from it.
+const STALL_ABANDON_FACTOR = 10;
 
 function median(values) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -33,6 +42,16 @@ function residualRatio(window, slopePerMs, total, firstValue) {
   const intercept = median(window.map((p) => p.value - slopePerMs * p.t));
   const residuals = window.map((p) => Math.abs(slopePerMs * p.t + intercept - p.value));
   return median(residuals) / span;
+}
+
+// How long it has been since the signal's last sample, in units of its own
+// typical sampling gap. gapMs is null when there are not yet enough samples
+// (fewer than 2) to know what "typical" is.
+function staleness(samples, nowMs) {
+  const n = samples.length;
+  if (n < 2) return { silenceMs: 0, gapMs: null };
+  const gapMs = Math.max(STALL_MIN_GAP_MS, (samples[n - 1].t - samples[0].t) / (n - 1));
+  return { silenceMs: nowMs - samples[n - 1].t, gapMs };
 }
 
 export function estimate(signal, nowMs, startMs, prior = null) {
@@ -88,16 +107,38 @@ export function estimate(signal, nowMs, startMs, prior = null) {
     observed = { eta: solo, low: solo, high: solo };
   }
   if (observed !== null) {
-    const pad = Math.max(MIN_BAND_PAD, residualRatio(window, slopePerMs, signal.total, samples[0].value));
+    const { silenceMs, gapMs } = staleness(samples, nowMs);
+    let pad = Math.max(MIN_BAND_PAD, residualRatio(window, slopePerMs, signal.total, samples[0].value));
+    if (gapMs !== null && silenceMs >= STALL_WIDEN_FACTOR * gapMs) {
+      // Scale extra widening from the widen threshold up to a full extra
+      // 100% spread at the abandon threshold, where observed gets dropped
+      // entirely below.
+      const stallSpan = (STALL_ABANDON_FACTOR - STALL_WIDEN_FACTOR) * gapMs;
+      const stallExtra = Math.min(1, (silenceMs - STALL_WIDEN_FACTOR * gapMs) / stallSpan);
+      pad = Math.max(pad, MIN_BAND_PAD + stallExtra);
+    }
     observed.low = Math.max(0, observed.low * (1 - pad));
     observed.high = observed.high * (1 + pad);
+    if (gapMs !== null && silenceMs >= STALL_ABANDON_FACTOR * gapMs) {
+      // The signal has gone quiet for many multiples of its own cadence:
+      // the rate this was projected from no longer means anything, and
+      // continuing to report it would be a static, confidently wrong
+      // number rather than an honest "don't know". Fall through to
+      // whatever the prior (or nothing) says below, same as if this
+      // signal had produced no usable rate in the first place.
+      observed = null;
+    }
   }
 
-  const priorRemaining =
-    prior === null || prior === undefined ? null : Math.max(0, prior.medianSeconds - elapsedSeconds);
+  // Unclamped, so "prior time has already passed with nothing live to look
+  // at" is distinguishable from "on track": clamping here would turn an
+  // exceeded prior into a confident "any second now" instead of admitting
+  // this run is already taking longer than history suggested.
+  const priorRemainingRaw = prior === null || prior === undefined ? null : prior.medianSeconds - elapsedSeconds;
+  const priorRemaining = priorRemainingRaw === null ? null : Math.max(0, priorRemainingRaw);
 
   if (observed === null) {
-    if (priorRemaining !== null) {
+    if (priorRemainingRaw !== null && priorRemainingRaw > 0) {
       est.etaSeconds = priorRemaining;
       est.lowSeconds = 0.75 * priorRemaining;
       est.highSeconds = 1.25 * priorRemaining;

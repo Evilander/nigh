@@ -6,6 +6,9 @@ export function createTracker(opts = {}) {
   const signals = new Map();
   const wantTotal = opts.total ?? null;
   const wantLabel = opts.label ?? null;
+  // The signal primary() returned last time, if any: see the stickiness
+  // comment on primary() below.
+  let stickyKey = null;
 
   function observe(counters, t) {
     for (const c of counters) {
@@ -55,7 +58,24 @@ export function createTracker(opts = {}) {
       b.last.t - a.last.t ||
       a.first.t - b.first.t
     );
-    return list[0];
+    const top = list[0];
+    // Stickiness: a nested inner loop (e.g. outer "file 1/5", inner
+    // "chunk 1/100") ranks ahead of the outer one by total desc for the
+    // whole of its first cycle, before it has ever reset - resets is tied
+    // at 0 for both until then, and the inner one's bigger total wins that
+    // tiebreak. Once a signal has been selected, keep it as long as nothing
+    // has strictly fewer resets than it (i.e. it is still tied for best on
+    // resets); a bigger total or more samples alone must not dethrone it.
+    // This only affects repeated primary() calls on the same tracker: any
+    // single call still returns the plain top-ranked signal.
+    if (stickyKey !== null) {
+      const incumbent = signals.get(stickyKey);
+      if (incumbent !== undefined && incumbent.resets <= top.resets) {
+        return incumbent;
+      }
+    }
+    stickyKey = top.key;
+    return top;
   }
 
   return { observe, primary, all };

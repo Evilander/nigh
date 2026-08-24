@@ -1,6 +1,6 @@
 // Spawns a command, tees its stdout/stderr through unchanged, and drives the
 // counter -> signal -> estimate -> render pipeline off of what it prints.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import os from 'node:os';
 import { createLineSplitter, extractCounters } from './parse.js';
 import { createTracker } from './signals.js';
@@ -37,6 +37,72 @@ function spawnWithRetry(file, args, spawnOptions) {
   });
 }
 
+// Best-effort whole-tree termination. A plain child.kill() only reaches the
+// direct child, so a wrapped shell/script's own children (e.g.
+// `nigh -- sh -c "long-running-thing"`) can outlive nigh. On POSIX the child
+// is spawned detached into its own process group (see the spawn options
+// below), so a negative pid signals the whole group. Windows has no
+// equivalent via child.kill(); this shells out to the built-in taskkill
+// /T (tree) /F (force) instead.
+export function killTree(child, signal) {
+  if (process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true });
+      return;
+    } catch {
+      // taskkill itself unavailable: fall through to a direct kill below.
+    }
+  } else {
+    try {
+      process.kill(-child.pid, signal); // negative pid: the whole process group
+      return;
+    } catch {
+      // no such group (e.g. child already gone): fall through.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // child already gone; nothing to signal.
+  }
+}
+
+// Wraps a destination Writable so that (1) EPIPE and other destination
+// errors are swallowed instead of crashing the process - once one happens,
+// further writes to that destination are silently dropped rather than
+// re-throwing or spamming - and (2), when `source` is given, writes honour
+// backpressure by pausing it until the destination drains. `source` is the
+// upstream Readable being copied through this destination, if any; it is
+// what needs to pause when the destination cannot keep up.
+export function createSink(destStream, source, onBroken) {
+  let broken = false;
+  function markBroken() {
+    if (broken) return;
+    broken = true;
+    if (onBroken) onBroken();
+  }
+  // destStream is documented as a Writable, but tests commonly pass a
+  // minimal { write() } double with no event emitter behind it; only wire
+  // up 'error'/'drain' handling when there is one to listen on.
+  if (typeof destStream.on === 'function') {
+    destStream.on('error', markBroken);
+    if (source) {
+      destStream.on('drain', () => {
+        if (source.isPaused()) source.resume();
+      });
+    }
+  }
+  return function write(chunk) {
+    if (broken) return;
+    try {
+      const ok = destStream.write(chunk);
+      if (ok === false && source) source.pause();
+    } catch {
+      markBroken();
+    }
+  };
+}
+
 function estimateSignature(est) {
   const round = (v, places) => (v === null || v === undefined ? null : Math.round(v * 10 ** places) / 10 ** places);
   return JSON.stringify({
@@ -68,6 +134,7 @@ export async function run(argv, opts = {}) {
     ascii = false,
     stdout = process.stdout,
     stderr = process.stderr,
+    statusStream = null,
     now = Date.now,
     env,
   } = opts;
@@ -78,24 +145,30 @@ export async function run(argv, opts = {}) {
   const historyPath = historyFile === undefined ? defaultHistoryPath() : historyFile;
   const historyEnabled = historyPath !== 'off';
   const key = commandKey(argv);
-  let history = null;
-  let priorEstimate = null;
-  if (historyEnabled) {
-    history = loadHistory(historyPath);
-    priorEstimate = historyPrior(history, key);
-  }
-
-  const statusLine = json ? null : createStatusLine(stderr, { isTTY: Boolean(stderr.isTTY), intervalMs, now });
-
-  function writeJsonEvent(obj) {
-    stderr.write(`${JSON.stringify(obj)}\n`);
-  }
+  const priorEstimate = historyEnabled ? historyPrior(loadHistory(historyPath), key) : null;
 
   const child = await spawnWithRetry(argv[0], argv.slice(1), {
     stdio: ['inherit', 'pipe', 'pipe'],
     windowsHide: true,
+    detached: process.platform !== 'win32',
     env: env ?? process.env,
   });
+
+  // Where nigh's own output (status line, JSON events, the final summary)
+  // goes. By default that's stderr, shared with the child's own stderr
+  // bytes; statusStream (bin/nigh.js's --status-fd / --status-file) gives
+  // that a separate home so stderr carries only the child, byte for byte.
+  // When stderr is shared, the sink that writes to it is also the pause
+  // point for the child's stderr stream; when it is not, nothing
+  // child-related flows through the status destination, so there is
+  // nothing to pause there.
+  const statusDest = statusStream ?? stderr;
+  const writeStatus = createSink(statusDest, statusStream ? null : child.stderr);
+  const statusLine = json ? null : createStatusLine({ write: writeStatus }, { isTTY: Boolean(statusDest.isTTY), intervalMs, now });
+
+  function writeJsonEvent(obj) {
+    writeStatus(`${JSON.stringify(obj)}\n`);
+  }
 
   if (json) writeJsonEvent({ event: 'start', argv, pid: child.pid, t: 0 });
 
@@ -111,14 +184,28 @@ export async function run(argv, opts = {}) {
     }
   }
 
+  // A broken stdout means nobody is reading any more (`nigh -- cmd | head -1`).
+  // Without this the child keeps producing into a pipe nigh alone still drains,
+  // so the pipeline never ends - a plain `cmd | head -1` would have died of
+  // SIGPIPE immediately. Stop the child tree and report the conventional 141.
+  let stdoutBroke = false;
+  const writeStdout = createSink(stdout, child.stdout, () => {
+    stdoutBroke = true;
+    killTree(child, 'SIGTERM');
+  });
   child.stdout.on('data', (chunk) => {
-    stdout.write(chunk);
+    writeStdout(chunk);
     handleLines(outSplitter.push(chunk), now());
   });
 
+  // Raw stderr sink: only needed when statusStream keeps the status channel
+  // separate, so the child's own bytes go straight through instead of via
+  // the status line's clear/redraw dance.
+  const writeStderrRaw = statusStream ? createSink(stderr, child.stderr) : null;
   child.stderr.on('data', (chunk) => {
-    if (statusLine) statusLine.passthrough(chunk);
-    else stderr.write(chunk);
+    if (writeStderrRaw) writeStderrRaw(chunk);
+    else if (statusLine) statusLine.passthrough(chunk);
+    else writeStatus(chunk); // json mode sharing stderr: raw bytes interleave with JSON events
     handleLines(errSplitter.push(chunk), now());
   });
 
@@ -157,13 +244,7 @@ export async function run(argv, opts = {}) {
 
   const forwarded = ['SIGINT', 'SIGTERM'];
   const signalHandlers = forwarded.map((sig) => {
-    const handler = () => {
-      try {
-        child.kill(sig);
-      } catch {
-        // child may already be gone; nothing to forward to.
-      }
-    };
+    const handler = () => killTree(child, sig);
     process.on(sig, handler);
     return [sig, handler];
   });
@@ -174,8 +255,19 @@ export async function run(argv, opts = {}) {
       for (const [sig, handler] of signalHandlers) process.removeListener(sig, handler);
 
       const finishedMs = now();
+      // Parse whatever unterminated text is left in either splitter before
+      // the final estimate: a child that exits right after e.g.
+      // process.stdout.write("10/10") with no trailing newline would
+      // otherwise never have that last counter observed.
+      handleLines(outSplitter.flush(), finishedMs);
+      handleLines(errSplitter.flush(), finishedMs);
+
       const durationSeconds = Math.max(0, (finishedMs - startMs) / 1000);
-      const exitCode = signal ? 128 + (os.constants.signals[signal] ?? 0) : (code ?? 0);
+      // 141 is the conventional "died of SIGPIPE" status; Windows has no
+      // SIGPIPE in os.constants, so the number is spelled out.
+      const exitCode = stdoutBroke
+        ? 141
+        : signal ? 128 + (os.constants.signals[signal] ?? 0) : (code ?? 0);
       const primary = tracker.primary();
       const finalEstimate = estimate(primary, finishedMs, startMs, priorEstimate);
 
@@ -186,13 +278,19 @@ export async function run(argv, opts = {}) {
       }
 
       if (historyEnabled) {
-        history = recordRun(history, key, {
-          durationSeconds,
-          total: primary ? primary.total : null,
-          finishedAt: new Date().toISOString(),
-        });
         try {
-          saveHistory(history, historyPath);
+          // Reload fresh right before merging: another nigh process racing
+          // on the same history file may have saved its own run since this
+          // one started, and merging into that stale in-memory copy instead
+          // would silently drop it.
+          const fresh = loadHistory(historyPath);
+          const updated = recordRun(fresh, key, {
+            durationSeconds,
+            total: primary ? primary.total : null,
+            finishedAt: new Date().toISOString(),
+            exitCode,
+          });
+          saveHistory(updated, historyPath);
         } catch {
           // history is a convenience, not a correctness requirement: a
           // write failure (e.g. a read-only home dir) must not fail the run.

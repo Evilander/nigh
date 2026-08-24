@@ -1,10 +1,27 @@
 import { StringDecoder } from 'node:string_decoder';
 
-// CSI sequences (colours "...m", cursor clears "...K"/"...J") plus two-byte ESC codes.
-const ANSI_RE = /\[[0-?]*[ -/]*[@-~]|[@-_]/g;
+// CSI sequences (colours "...m", cursor clears "...K"/"...J"), OSC sequences
+// (terminal hyperlinks, window titles: ESC ] ... BEL or ESC ] ... ESC \), and
+// two-byte ESC codes. OSC is tried before the two-byte fallback: "]" (like
+// "[") falls in the two-byte class, so trying that alternative first would
+// match only "ESC ]" and leave the hyperlink body and terminator behind.
+const ANSI_RE = /\[[0-?]*[ -/]*[@-~]|\][\s\S]*?(?:|\\)|[@-_]/g;
 
 export function stripAnsi(s) {
   return s.replace(ANSI_RE, '');
+}
+
+// Retained-tail cap: a stream with no line terminator for this long stops
+// being parsed. Without this, an unbroken stream (binary data, or just a
+// very long line) makes tail + decoder.write(chunk) copy an ever-growing
+// string on every push() call.
+const MAX_TAIL_CHARS = 64 * 1024;
+
+// Cheap binary heuristic: a NUL byte essentially never appears in text a
+// program prints, but is common early in arbitrary binary data.
+const NUL_CHAR = String.fromCharCode(0);
+function looksBinary(chunk) {
+  return typeof chunk === 'string' ? chunk.indexOf(NUL_CHAR) !== -1 : chunk.includes(0);
 }
 
 export function createLineSplitter() {
@@ -13,6 +30,10 @@ export function createLineSplitter() {
   // A \r in last position of a push is emitted as a terminator right away;
   // if the next push starts with \n, that \n completes the CRLF and is swallowed.
   let crAtEnd = false;
+  // Once a stream looks binary, stop trying to parse it as lines: nothing
+  // useful will come from it, and it's usually just wasted work. The caller
+  // still writes the raw chunk through untouched; this only affects parsing.
+  let binary = false;
 
   function splitInto(buf, lines) {
     let start = 0;
@@ -36,6 +57,12 @@ export function createLineSplitter() {
 
   return {
     push(chunk) {
+      if (binary) return [];
+      if (looksBinary(chunk)) {
+        binary = true;
+        tail = '';
+        return [];
+      }
       let buf = tail + decoder.write(chunk);
       tail = '';
       if (crAtEnd && buf.length > 0) {
@@ -44,9 +71,19 @@ export function createLineSplitter() {
       }
       const lines = [];
       tail = splitInto(buf, lines);
+      if (tail.length > MAX_TAIL_CHARS) {
+        // No terminator in a very long stretch: this is not going to
+        // usefully parse as a counter. Drop it so an unbroken stream can't
+        // grow this string (and the cost of rebuilding it every push) without bound.
+        tail = '';
+      }
       return lines;
     },
     flush() {
+      if (binary) {
+        decoder.end();
+        return [];
+      }
       const rest = tail + decoder.end();
       tail = '';
       crAtEnd = false;
@@ -75,10 +112,10 @@ function fractionFrom(line, m) {
   const total = plainNumber(m[2]);
   if (!(total > 0) || value > total) return null;
   const before = m.index > 0 ? line[m.index - 1] : '';
-  if (/[A-Za-z.]/.test(before)) return null; // version "v1/2" or decimal "1.5/2"
+  if (/[A-Za-z./\\]/.test(before)) return null; // version "v1/2", decimal "1.5/2", or a path segment
   const rest = line.slice(m.index + m[0].length);
   if (rest.startsWith('.')) return null; // decimal "2/2.5" or path "2/3.js"
-  if (/^\s*\/\s*\d/.test(rest)) return null; // three-part date chain "08/24/2026"
+  if (/^\s*[/\\]/.test(rest)) return null; // three-part date chain "08/24/2026" or a path continuation
   if ((YEAR_TOK.test(m[1]) && SHORT_TOK.test(m[2])) || (YEAR_TOK.test(m[2]) && SHORT_TOK.test(m[1]))) {
     return null; // year/month or month/year "2026/08"
   }

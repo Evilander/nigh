@@ -55,6 +55,14 @@ test('statusText renders the ascii bar form', () => {
   );
 });
 
+test('statusText clamps an out-of-range fraction instead of throwing', () => {
+  const over = statusText({ fraction: 1.4, est: est({ fraction: 1.4 }), label: '', value: 140, total: 100 });
+  assert.match(over, /^nigh ▕█{16}▏ 100% ·/);
+
+  const under = statusText({ fraction: -0.2, est: est({ fraction: -0.2 }), label: '', value: -20, total: 100 });
+  assert.match(under, /^nigh ▕░{16}▏ 0% ·/);
+});
+
 test('statusText with fraction null shows no bar and estimating...', () => {
   const text = statusText({
     fraction: null,

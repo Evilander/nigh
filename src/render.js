@@ -8,12 +8,16 @@ export function statusText(view) {
   const parts = [];
   if (hasFraction) {
     const cells = view.width ?? BAR_CELLS;
-    const filled = Math.round(view.fraction * cells);
+    // Clamp before deriving filled/empty cell counts: an out-of-range
+    // fraction would otherwise make cells - filled negative, and
+    // String.prototype.repeat() throws on a negative count.
+    const fraction = Math.min(1, Math.max(0, view.fraction));
+    const filled = Math.round(fraction * cells);
     const bar = view.ascii
       ? '#'.repeat(filled) + '-'.repeat(cells - filled)
       : '█'.repeat(filled) + '░'.repeat(cells - filled);
     const barText = view.ascii ? `nigh [${bar}]` : `nigh ▕${bar}▏`;
-    parts.push(`${barText} ${Math.round(view.fraction * 100)}%`);
+    parts.push(`${barText} ${Math.round(fraction * 100)}%`);
   } else {
     parts.push('nigh');
   }

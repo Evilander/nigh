@@ -9,9 +9,12 @@ $ nigh -- make -j8
 nigh ▕██████░░░░░░░░░░▏ 36% · 3m10s left (2m40s–4m00s) · 1m48s elapsed · 43/120
 ```
 
-The command runs unchanged. Its stdout and stderr pass through byte for byte, so you can
-still pipe them. `nigh` reads the same lines you see, finds the counters a program
-already prints (`43/120`, `12 of 20`, `45%`), and keeps a running estimate on stderr.
+The command runs unchanged. Its stdout passes through byte for byte, so you can still pipe
+it. By default stderr carries the status line and JSON events described below, interleaved
+with whatever the command itself writes to stderr; use `--status-file` or `--status-fd`
+when you need stderr to be nothing but the command's own bytes. `nigh` reads the same lines
+you see, finds the counters a program already prints (`43/120`, `12 of 20`, `45%`), and
+keeps a running estimate.
 
 It never guesses from bare numbers. If a program prints nothing that looks like a
 counter, the status line says `estimating...` and, on the second run, `about 4m50s (from
@@ -32,14 +35,16 @@ npx nigh -- <command>
 ```
 nigh [options] [--] <command> [args...]
 
-  --json            NDJSON events on stderr instead of the status line
-  --quiet           no status line, only the final summary
-  --interval MS     how often to print when stderr is not a terminal (default 5000)
-  --history FILE    history file (default ~/.config/nigh/history.json); "off" disables it
-  --total N         trust only counters whose total is N
-  --label NAME      trust only counters labelled NAME (the word before the number)
-  --ascii           plain [####----] bar
-  --experimental    accepted, no effect yet (bare-number counters are not in this version)
+  --json              NDJSON events on stderr instead of the status line
+  --quiet             no status line, only the final summary
+  --interval MS       how often to print when stderr is not a terminal (default 5000)
+  --history FILE      history file (default ~/.config/nigh/history.json); "off" disables it
+  --status-file FILE  write the status line / JSON events to FILE instead of stderr
+  --status-fd N       like --status-file, but to an already-open file descriptor
+  --total N           trust only counters whose total is N (must be > 0)
+  --label NAME        trust only counters labelled NAME (the word before the number; case-insensitive)
+  --ascii             plain [####----] bar
+  --experimental      accepted, no effect yet (bare-number counters are not in this version)
 ```
 
 `--` separates options from the command. Without it, the first word that does not start
@@ -80,7 +85,21 @@ appears, the prior fades out over the first 15% of progress.
   `estimating...`. PTY support is the obvious next step and is not in this version.
 - `nigh` reports what a counter implies; if a program prints `3/10` and then does an
   unannounced hour of work after `10/10`, the ETA was wrong the way the program was wrong.
-- Counters with units (`12/120 MB`) are treated as counters with the label `mb`.
+- The label comes only from the word(s) immediately before a counter; units or other text
+  after it (`12/120 MB`) are not captured, so a bare `12/120 MB` with nothing before it
+  gets an empty label.
+- Without `--status-file`/`--status-fd`, stderr is not a byte-exact copy of what the command
+  would print on its own: the status line, JSON events, and final summary share it,
+  interleaved with the command's real stderr output. Only stdout is guaranteed byte-exact
+  in every mode.
+- If a counter's signal goes quiet for a long stretch relative to its own pace, `nigh`
+  widens the band and then falls back to `estimating...` rather than keep reporting a
+  frozen, increasingly wrong number.
+- `SIGINT`/`SIGTERM` sent to `nigh` are forwarded to the whole process tree it spawned, not
+  just the direct child, so a wrapped shell script's own children are also stopped.
+- If whatever is reading `nigh`'s stdout goes away (`nigh -- cmd | head -1`), the child's
+  process tree is stopped and `nigh` exits `141`, the conventional broken-pipe status — the
+  same way the command would have died on its own without a wrapper in the middle.
 - Windows: `.cmd` shims are resolved when the plain name is not found.
 
 ## Closest tools
@@ -98,9 +117,10 @@ npm test
 ```
 
 `node:test` suites for parsing, signal selection, the estimator (including a synthetic log
-bench with steady, accelerating, decelerating and nested scenarios), history, rendering, and
-an end-to-end run against fixture programs (byte-exact passthrough, exit codes, `\r`
-progress, stderr counters, JSON events, history prior).
+bench with steady, accelerating, decelerating and nested scenarios), history, rendering, an
+end-to-end run against fixture programs (byte-exact passthrough, exit codes, `\r` progress,
+stderr counters, JSON events, history prior, EPIPE/backpressure, process-tree kill), and the
+CLI's own flag parsing.
 
 ## License
 

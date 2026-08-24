@@ -112,6 +112,38 @@ test('an empty tracker has no primary and no signals', () => {
   assert.deepEqual(createTracker().all(), []);
 });
 
+test('primary is sticky: an established outer fraction is not displaced by a same-kind ' +
+  'inner fraction with a larger total, before the inner ever resets', () => {
+  const tracker = createTracker();
+  tracker.observe([frac(1, 5, 'file')], 0);
+  assert.equal(tracker.primary().key, 'fraction:file:5', 'the outer signal starts as primary while it is alone');
+
+  // The inner loop ramps past the outer's total and, being same-kind with
+  // zero resets so far, would win the plain total-desc tiebreak - but the
+  // outer signal was already selected and neither has fewer resets than
+  // the other, so it should stay primary through the whole first inner cycle.
+  for (let i = 1; i <= 50; i += 1) {
+    tracker.observe([frac(i, 100, 'chunk')], i * 10);
+    if (i === 1 || i === 25 || i === 50) {
+      assert.equal(tracker.primary().key, 'fraction:file:5', `still outer at inner step ${i}`);
+    }
+  }
+
+  // Once the inner loop actually resets, it falls behind on resets and the
+  // (already-primary) outer signal remains the correct choice on that basis too.
+  tracker.observe([frac(1, 100, 'chunk')], 510);
+  assert.equal(tracker.all().find((s) => s.key === 'fraction:chunk:100').resets, 1);
+  assert.equal(tracker.primary().key, 'fraction:file:5');
+});
+
+test('primary stickiness does not apply across separate trackers or before any call', () => {
+  // Sanity check: a signal only becomes sticky once primary() has actually
+  // returned it, not merely by being observed.
+  const tracker = createTracker();
+  tracker.observe([frac(1, 5, 'small'), frac(1, 100, 'large')], 0);
+  assert.equal(tracker.primary().key, 'fraction:large:100', 'first call: plain ranking, larger total wins');
+});
+
 test('opts.total ignores fraction/of signals with a different total', () => {
   const tracker = createTracker({ total: 120 });
   tracker.observe([frac(1, 200, 'big'), frac(1, 120, 'good'), pct(50, 'any')], 0);

@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { run } from '../src/run.js';
+import { run, createSink, killTree } from '../src/run.js';
 
 const node = process.execPath;
 const fixture = (name) => path.join(import.meta.dirname, 'fixtures', name);
@@ -33,6 +33,15 @@ function parseNdjson(text) {
 
 function tempHistoryPath() {
   return path.join(os.tmpdir(), `nigh-history-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 test('passthrough byte-fidelity: stdout is identical to the fixture run directly', async () => {
@@ -83,6 +92,170 @@ test('primary signal selection: stderr-only progress is tracked', async () => {
   const err = collectStream();
   const result = await run([node, fixture('stderr-progress.js'), '30', '5'], { historyFile: 'off', stdout: out, stderr: err });
   assert.equal(result.primary.total, 30);
+});
+
+test('a final counter with no trailing newline is parsed before the final estimate', async () => {
+  const out = collectStream();
+  const err = collectStream();
+  const result = await run([node, fixture('no-newline.js')], { historyFile: 'off', stdout: out, stderr: err });
+  assert.equal(result.exitCode, 0);
+  assert.equal(out.text(), '10/10', 'stdout passthrough must still be byte-exact, no newline added');
+  assert.equal(result.primary.total, 10);
+  assert.equal(result.primary.last.value, 10);
+  assert.equal(result.primary.fraction(), 1);
+});
+
+test('statusStream keeps stderr as nothing but the child\'s own bytes', async () => {
+  const out = collectStream();
+  const err = collectStream();
+  const status = collectStream();
+  const result = await run([node, fixture('stderr-progress.js'), '4', '5'], {
+    historyFile: 'off',
+    stdout: out,
+    stderr: err,
+    statusStream: status,
+  });
+  assert.equal(result.exitCode, 0);
+  // stderr-progress.js writes only decoys and "[i/N] step" lines to stderr;
+  // none of nigh's own status text (bar characters, "elapsed", "done in") should appear.
+  assert.ok(!err.text().includes('elapsed'), 'stderr must not carry nigh\'s own status text');
+  assert.ok(err.text().includes('[4/4] step'), 'stderr must still carry the child\'s real output');
+  assert.ok(status.text().length > 0, 'the status destination should have received something');
+});
+
+test('statusStream + --json produces clean NDJSON with no child bytes interleaved', async () => {
+  const out = collectStream();
+  const err = collectStream();
+  const status = collectStream();
+  const result = await run([node, fixture('stderr-progress.js'), '4', '5'], {
+    json: true,
+    tickMs: 20,
+    historyFile: 'off',
+    stdout: out,
+    stderr: err,
+    statusStream: status,
+  });
+  assert.equal(result.exitCode, 0);
+  const events = parseNdjson(status.text()); // throws on any non-JSON line: proves it's clean NDJSON
+  assert.ok(events.some((e) => e.event === 'exit'));
+  assert.ok(err.text().includes('[4/4] step'), 'the child\'s real stderr output still arrives, just on stderr instead');
+});
+
+test('a stdout that throws EPIPE stops the child and reports 141', async () => {
+  const err = collectStream();
+  let calls = 0;
+  const out = {
+    isTTY: false,
+    write() {
+      calls += 1;
+      if (calls === 2) {
+        const epipe = new Error('write EPIPE');
+        epipe.code = 'EPIPE';
+        throw epipe;
+      }
+      return true;
+    },
+  };
+  // A long fixture: if the broken pipe did not end the run, this would take
+  // 200 * 20ms rather than stopping at the second write.
+  const result = await run([node, fixture('steady.js'), '200', '20'], { historyFile: 'off', stdout: out, stderr: err });
+  assert.equal(result.exitCode, 141, 'a broken stdout should end the run with the SIGPIPE status');
+  assert.ok(calls >= 2, 'the EPIPE should actually have been hit');
+  assert.ok(result.durationSeconds < 3, 'the run should stop at the broken pipe, not play out the fixture');
+});
+
+test('killTree terminates the whole process tree, not just the direct child', async () => {
+  const pidFile = path.join(os.tmpdir(), `nigh-grandchild-pid-${process.pid}-${Date.now()}.txt`);
+  try {
+    const child = spawn(node, [fixture('spawns-grandchild.js'), pidFile], { stdio: 'ignore' });
+    for (let i = 0; i < 50 && !fs.existsSync(pidFile); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(fs.existsSync(pidFile), 'grandchild should have announced its pid');
+    const grandchildPid = Number(fs.readFileSync(pidFile, 'utf8'));
+    assert.ok(pidAlive(grandchildPid), 'grandchild should be alive before killTree');
+
+    killTree(child, 'SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 500)); // give the OS a moment to reap it
+
+    assert.equal(pidAlive(grandchildPid), false, 'grandchild should not survive killTree');
+    assert.equal(pidAlive(child.pid), false, 'the direct child should not survive killTree either');
+  } finally {
+    fs.rmSync(pidFile, { force: true });
+  }
+});
+
+test('createSink: a false write() pauses the source, a drain event resumes it', () => {
+  let writeReturn = true;
+  const written = [];
+  const drainHandlers = [];
+  const dest = {
+    write(chunk) {
+      written.push(chunk);
+      return writeReturn;
+    },
+    on(event, handler) {
+      if (event === 'drain') drainHandlers.push(handler);
+    },
+  };
+  let paused = false;
+  const source = {
+    pause() {
+      paused = true;
+    },
+    resume() {
+      paused = false;
+    },
+    isPaused() {
+      return paused;
+    },
+  };
+  const write = createSink(dest, source);
+  write('a');
+  assert.equal(paused, false);
+  writeReturn = false;
+  write('b');
+  assert.equal(paused, true, 'a false write() return should pause the source');
+  drainHandlers.forEach((h) => h());
+  assert.equal(paused, false, 'a drain event should resume the source');
+  assert.deepEqual(written, ['a', 'b']);
+});
+
+test('createSink: an EPIPE error event stops further writes without throwing', () => {
+  const errorHandlers = [];
+  const written = [];
+  const dest = {
+    write(chunk) {
+      written.push(chunk);
+      return true;
+    },
+    on(event, handler) {
+      if (event === 'error') errorHandlers.push(handler);
+    },
+  };
+  const write = createSink(dest);
+  write('a');
+  const epipe = new Error('write EPIPE');
+  epipe.code = 'EPIPE';
+  errorHandlers.forEach((h) => h(epipe));
+  write('b');
+  assert.deepEqual(written, ['a'], 'no further writes should reach the destination after it errors');
+});
+
+test('createSink: a synchronously thrown EPIPE is swallowed, not propagated', () => {
+  let calls = 0;
+  const dest = {
+    write() {
+      calls += 1;
+      const epipe = new Error('write EPIPE');
+      epipe.code = 'EPIPE';
+      throw epipe;
+    },
+  };
+  const write = createSink(dest);
+  assert.doesNotThrow(() => write('a'));
+  write('b'); // should be a silent no-op now, not call dest.write() again
+  assert.equal(calls, 1);
 });
 
 test('JSON mode: NDJSON on stderr with start, counter, estimate and exactly one exit event', async () => {

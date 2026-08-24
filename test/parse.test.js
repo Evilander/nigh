@@ -61,6 +61,44 @@ test('splitter: ANSI colour and cursor sequences are stripped from lines', () =>
   assert.deepEqual(s.push('\x1b[32mok\x1b[0m \x1b[2K3/9\x1b[1A\r'), ['ok 3/9']);
 });
 
+test('stripAnsi removes an OSC 8 hyperlink wrapper, including an embedded URL', () => {
+  const wrapped = '\x1b]8;;https://example.com/3/10\x1b\\click here\x1b]8;;\x1b\\';
+  assert.equal(stripAnsi(wrapped), 'click here');
+});
+
+test('stripAnsi also strips a BEL-terminated OSC sequence', () => {
+  assert.equal(stripAnsi('\x1b]0;window title\x07after'), 'after');
+});
+
+test('end-to-end: a counter-shaped URL hidden inside an OSC 8 hyperlink does not leak', () => {
+  const s = createLineSplitter();
+  const [line] = s.push('\x1b]8;;https://example.com/3/10\x1b\\click here\x1b]8;;\x1b\\\n');
+  assert.equal(line, 'click here');
+  assert.deepEqual(extractCounters(line), []);
+});
+
+test('splitter: a NUL byte marks the stream binary; line parsing stops but does not throw', () => {
+  const s = createLineSplitter();
+  const withNul = Buffer.concat([Buffer.from('abc'), Buffer.from([0]), Buffer.from('3/10\n')]);
+  assert.deepEqual(s.push(withNul), []);
+  assert.deepEqual(s.push('more 4/10\n'), []); // stays binary for the rest of the stream
+  assert.deepEqual(s.flush(), []);
+});
+
+test('splitter: normal text with no NUL byte is unaffected by binary detection', () => {
+  const s = createLineSplitter();
+  assert.deepEqual(s.push('3/10\n'), ['3/10']);
+});
+
+test('splitter: an unbounded line resets its retained tail once it exceeds the cap', () => {
+  const s = createLineSplitter();
+  const big = 'x'.repeat(70 * 1024); // one push, already past the 64 KiB cap
+  assert.deepEqual(s.push(big), []); // no terminator yet, so nothing is emitted
+  // if the oversized tail had not been dropped, this would complete one giant
+  // line starting with all those "x"s instead of just "3/10".
+  assert.deepEqual(s.push('3/10\n'), ['3/10']);
+});
+
 test('end-to-end: ANSI progress frames rewritten with CR split and count cleanly', () => {
   const s = createLineSplitter();
   const lines = [
@@ -141,6 +179,9 @@ test('decoys yield nothing', () => {
     '150%',
     '12/0',
     '13/12',
+    'src/3/10/file',
+    'C:\\tmp\\3/10',
+    '/3/10',
   ];
   for (const decoy of decoys) {
     assert.deepEqual(extractCounters(decoy), [], decoy);

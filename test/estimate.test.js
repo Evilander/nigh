@@ -105,6 +105,47 @@ test('steady signal gets an exact eta', () => {
   near(est.etaSeconds, 180, 1e-6);
 });
 
+test('a silent signal past the widen threshold gets a wider band but the same eta', () => {
+  const samples = [];
+  for (let i = 1; i <= 20; i++) samples.push(pt(i * 1000, i));
+  const signal = sig(samples, 200);
+  const fresh = estimate(signal, 20000, 0); // queried right at the last sample: no silence
+  const stale = estimate(signal, 29000, 0); // 9s silence; gap is 1000ms (floored to 2000ms), widen kicks in at 8s
+  assert.equal(stale.basis, 'observed');
+  near(stale.etaSeconds, fresh.etaSeconds, 1e-9, 'the projected eta itself does not change, only the band');
+  assert.ok(
+    stale.highSeconds - stale.lowSeconds > fresh.highSeconds - fresh.lowSeconds,
+    'a stale signal should report a wider band than a fresh one at the same rate',
+  );
+});
+
+test('a signal silent past the abandon threshold stops projecting a live eta', () => {
+  const samples = [];
+  for (let i = 1; i <= 20; i++) samples.push(pt(i * 1000, i));
+  const est = estimate(sig(samples, 200), 41000, 0); // 21s silence; abandon kicks in at 20s
+  assert.equal(est.basis, 'none');
+  assert.equal(est.etaSeconds, null);
+  assert.equal(est.fraction, 0.1, 'the last known fraction is still reported, just not projected forward');
+});
+
+test('a signal silent past the abandon threshold falls back to a still-valid prior', () => {
+  const samples = [];
+  for (let i = 1; i <= 20; i++) samples.push(pt(i * 1000, i));
+  const est = estimate(sig(samples, 200), 41000, 0, { medianSeconds: 300, n: 5 });
+  assert.equal(est.basis, 'prior');
+  near(est.etaSeconds, 259, 1e-9); // 300 - 41s elapsed
+});
+
+test('a prior already exceeded by elapsed time (no live signal) reports estimating, not a confident zero', () => {
+  const atMedian = estimate(null, 100000, 0, { medianSeconds: 100, n: 3 });
+  assert.equal(atMedian.basis, 'none', 'exactly at the median: still not a confident number');
+  assert.equal(atMedian.etaSeconds, null);
+
+  const pastMedian = estimate(null, 150000, 0, { medianSeconds: 100, n: 3 });
+  assert.equal(pastMedian.basis, 'none');
+  assert.equal(pastMedian.etaSeconds, null);
+});
+
 test('blend weights observed vs prior by fraction/0.15', () => {
   // fraction 15/200 = 0.075 -> w = 0.5; rates 7.5/s -> observed 185/7.5; prior remaining 40-2 = 38
   const est = estimate(sig([pt(0, 0), pt(1000, 10), pt(2000, 15)], 200), 2000, 0, { medianSeconds: 40, n: 2 });
