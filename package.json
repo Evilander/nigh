@@ -1,0 +1,29 @@
+{
+  "name": "nigh",
+  "version": "0.1.0",
+  "description": "Run any command and get an honest ETA from what it already prints.",
+  "type": "module",
+  "bin": {
+    "nigh": "bin/nigh.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "keywords": [
+    "eta",
+    "progress",
+    "cli",
+    "wrapper",
+    "estimate"
+  ],
+  "license": "MIT"
+}
