@@ -25,10 +25,13 @@ history)`, because `nigh` remembers how long each command took last time.
 Node 22 or newer. No dependencies.
 
 ```
-npm install -g nigh
+npm install -g @evilander/nigh
 # or, without installing
-npx nigh -- <command>
+npx @evilander/nigh -- <command>
 ```
+
+Either way the command it installs is `nigh`. (The unscoped name on npm was
+unpublished by someone else in 2017 and the registry blocks reusing it.)
 
 ## Usage
 

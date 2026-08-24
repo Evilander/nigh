@@ -65,6 +65,27 @@ test('exit code propagation', async () => {
   assert.equal(passing.exitCode, 0);
 });
 
+test(
+  'a .cmd target spawns correctly, both via the bare-name retry and named directly',
+  { skip: process.platform !== 'win32' },
+  async () => {
+    const cmdFixture = fixture('counter.cmd');
+    const bareName = cmdFixture.replace(/\.cmd$/, ''); // no such file: forces the ENOENT retry path
+
+    const out1 = collectStream();
+    const err1 = collectStream();
+    const viaRetry = await run([bareName], { historyFile: 'off', stdout: out1, stderr: err1 });
+    assert.equal(viaRetry.exitCode, 0);
+    assert.equal(out1.text().trim(), '1/1 from-cmd-fixture');
+
+    const out2 = collectStream();
+    const err2 = collectStream();
+    const viaDirectName = await run([cmdFixture], { historyFile: 'off', stdout: out2, stderr: err2 });
+    assert.equal(viaDirectName.exitCode, 0);
+    assert.equal(out2.text().trim(), '1/1 from-cmd-fixture');
+  },
+);
+
 test('primary signal selection: steady picks the outer fraction', async () => {
   const out = collectStream();
   const err = collectStream();

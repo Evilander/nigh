@@ -10,19 +10,56 @@ import { commandKey, defaultHistoryPath, loadHistory, recordRun, prior as histor
 
 const DEFAULT_TICK_MS = 500;
 
+// A .cmd/.bat file is not directly executable at the Win32 API level;
+// spawning one without `shell: true` throws synchronously (EINVAL). Using
+// `shell: true` instead would concatenate argv into a shell string, which
+// Node's own deprecation warning flags as unsafe for arbitrary arguments -
+// exactly what a wrapped command's own args can be. Routing through
+// `cmd.exe /d /s /c` keeps args as a normal array (Node still quotes each
+// one for the Windows command line) while resolving the .cmd/.bat target;
+// `/d` skips registry AutoRun commands, `/s` fixes cmd's quote-stripping
+// so an argument that itself starts and ends with a quote survives intact.
+function isWindowsScript(file) {
+  return /\.(cmd|bat)$/i.test(file);
+}
+
+function spawnMaybeScript(file, args, spawnOptions) {
+  if (process.platform === 'win32' && isWindowsScript(file)) {
+    const comspec = process.env.ComSpec || 'cmd.exe';
+    return spawn(comspec, ['/d', '/s', '/c', file, ...args], spawnOptions);
+  }
+  return spawn(file, args, spawnOptions);
+}
+
 // spawn() reports a missing executable asynchronously via 'error', not by
 // throwing; on win32 a bare command (no extension) commonly needs the
-// ".cmd" shim (npm, npx, and friends are installed that way).
+// ".cmd" shim (npm, npx, and friends are installed that way). Both spawn
+// attempts are wrapped in try/catch: a .cmd/.bat target (explicit, or via
+// the retry appending ".cmd") throws synchronously rather than emitting
+// 'error', and an uncaught throw here would crash the whole process instead
+// of surfacing as the ordinary "command not found"-style error bin/nigh.js
+// already handles.
 function spawnWithRetry(file, args, spawnOptions) {
   return new Promise((resolve, reject) => {
-    let child = spawn(file, args, spawnOptions);
+    let child;
+    try {
+      child = spawnMaybeScript(file, args, spawnOptions);
+    } catch (err) {
+      reject(err);
+      return;
+    }
     let retried = false;
     function onError(err) {
       if (!retried && process.platform === 'win32' && err && err.code === 'ENOENT') {
         retried = true;
         child.removeListener('error', onError);
         child.removeListener('spawn', onSpawn);
-        child = spawn(`${file}.cmd`, args, spawnOptions);
+        try {
+          child = spawnMaybeScript(`${file}.cmd`, args, spawnOptions);
+        } catch (retryErr) {
+          reject(retryErr);
+          return;
+        }
         child.once('error', reject);
         child.once('spawn', () => resolve(child));
         return;
