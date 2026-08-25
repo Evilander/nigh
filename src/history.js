@@ -122,9 +122,8 @@ function optionMs(value, fallback) {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
-function isLockBusyError(err, lockPath) {
-  if (err?.code === 'EEXIST') return true;
-  return err?.code === 'EPERM' && fs.existsSync(lockPath);
+function isLockBusyError(err) {
+  return err?.code === 'EEXIST' || err?.code === 'EPERM' || err?.code === 'EACCES' || err?.code === 'EBUSY';
 }
 
 function ownerTokenFromFile(name) {
@@ -169,36 +168,36 @@ function recoverStaleLock(lockPath, staleMs) {
     // Windows can transiently report EPERM/EACCES while another process is
     // creating or removing the lock directory. Treat that as a busy lock and
     // retry instead of failing the history update.
-    if (err?.code === 'EPERM' || err?.code === 'EACCES' || err?.code === 'EBUSY') return false;
+    if (err?.code === 'EPERM' || err?.code === 'EACCES' || err?.code === 'EBUSY') return 'busy';
     throw err;
   }
-  if (!lock.exists) return true;
+  if (!lock.exists) return 'absent';
 
-  if (Date.now() - lock.mtimeMs < staleMs) return false;
+  if (Date.now() - lock.mtimeMs < staleMs) return 'busy';
 
   try {
     if (lock.kind === 'file') {
       fs.unlinkSync(lockPath);
-      return true;
+      return 'recovered';
     }
 
     for (const token of lock.owners) {
       try {
         fs.unlinkSync(lockOwnerFile(lockPath, token));
       } catch (err) {
-        if (err?.code !== 'ENOENT') return false;
+        if (err?.code !== 'ENOENT') return 'busy';
       }
     }
 
     const current = inspectLock(lockPath);
-    if (!current.exists) return true;
-    if (Date.now() - current.mtimeMs < staleMs) return false;
+    if (!current.exists) return 'recovered';
+    if (Date.now() - current.mtimeMs < staleMs) return 'busy';
 
     fs.rmdirSync(lockPath);
-    return true;
+    return 'recovered';
   } catch (err) {
-    if (err?.code === 'ENOENT') return true;
-    return false;
+    if (err?.code === 'ENOENT') return 'recovered';
+    return 'busy';
   }
 }
 
@@ -208,7 +207,7 @@ function tryAcquireHistoryLock(lockPath) {
   try {
     fs.mkdirSync(lockPath);
   } catch (err) {
-    if (isLockBusyError(err, lockPath)) return null;
+    if (isLockBusyError(err)) return null;
     throw err;
   }
 
@@ -243,13 +242,14 @@ async function acquireHistoryLock(lockPath, opts = {}) {
     const lock = tryAcquireHistoryLock(lockPath);
     if (lock) return lock;
 
-    if (recoverStaleLock(lockPath, staleMs)) continue;
+    const recovery = recoverStaleLock(lockPath, staleMs);
 
     const elapsedMs = Date.now() - startedAt;
     if (elapsedMs >= timeoutMs) {
       throw new Error(`Timed out waiting for history lock: ${lockPath}`);
     }
-    await delay(Math.min(retryMs, timeoutMs - elapsedMs));
+    const waitMs = recovery === 'recovered' ? 0 : Math.min(retryMs, timeoutMs - elapsedMs);
+    await delay(waitMs);
   }
 }
 

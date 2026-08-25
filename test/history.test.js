@@ -473,6 +473,160 @@ test('updateHistory retries a transient Windows permission race while inspecting
   assert.equal(fs.existsSync(lock), false);
 });
 
+test('updateHistory retries transient Windows lock mkdir errors as contention', async () => {
+  const codes = ['EPERM', 'EACCES', 'EBUSY'];
+
+  for (const [index, code] of codes.entries()) {
+    const dir = tmpDir();
+    const file = path.join(dir, 'history.json');
+    const lock = historyLockPath(file);
+    const key = commandKey(['make', code]);
+    const realMkdirSync = fs.mkdirSync;
+    let injections = 0;
+
+    fs.mkdirSync = function mkdirWithOneTransientLockError(target, ...args) {
+      if (injections === 0 && path.resolve(target) === path.resolve(lock)) {
+        injections++;
+        const err = new Error(`${code} from lock mkdir`);
+        err.code = code;
+        throw err;
+      }
+      return realMkdirSync.call(this, target, ...args);
+    };
+
+    try {
+      await historyModule.updateHistory(
+        file,
+        key,
+        { durationSeconds: index + 1, total: null, finishedAt: `t${index + 1}`, exitCode: 0 },
+        { timeoutMs: 1000, retryMs: 1, staleMs: 60_000 },
+      );
+    } finally {
+      fs.mkdirSync = realMkdirSync;
+    }
+
+    assert.equal(injections, 1);
+    assert.deepEqual(loadHistory(file)[key.exact].runs.map((r) => r.durationSeconds), [index + 1]);
+    assert.equal(fs.existsSync(lock), false);
+  }
+});
+
+test('updateHistory times out instead of spinning when lock mkdir keeps returning EPERM', async () => {
+  const dir = tmpDir();
+  const file = path.join(dir, 'history.json');
+  const lock = historyLockPath(file);
+  const realMkdirSync = fs.mkdirSync;
+  let attempts = 0;
+
+  fs.mkdirSync = function mkdirWithPersistentLockPermissionError(target, ...args) {
+    if (path.resolve(target) === path.resolve(lock)) {
+      attempts++;
+      if (attempts > 200) throw new Error('hot spin exceeded retry bound');
+      const err = new Error('persistent lock mkdir EPERM');
+      err.code = 'EPERM';
+      throw err;
+    }
+    return realMkdirSync.call(this, target, ...args);
+  };
+
+  const startedAt = Date.now();
+  try {
+    await assert.rejects(
+      historyModule.updateHistory(
+        file,
+        commandKey(['make']),
+        { durationSeconds: 1, total: null, finishedAt: 't1', exitCode: 0 },
+        { timeoutMs: 20, retryMs: 2, staleMs: 60_000 },
+      ),
+      /Timed out waiting for history lock/,
+    );
+  } finally {
+    fs.mkdirSync = realMkdirSync;
+  }
+
+  assert.ok(attempts > 1, 'persistent transient mkdir errors should be retried');
+  assert.ok(attempts < 200, 'persistent transient mkdir errors must not hot spin');
+  assert.ok(Date.now() - startedAt < 1000, 'timeout should stay bounded');
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('updateHistory timeout still applies when a stale lock is repeatedly replaced', async () => {
+  const dir = tmpDir();
+  const file = path.join(dir, 'history.json');
+  const lock = historyLockPath(file);
+  const realMkdirSync = fs.mkdirSync;
+  let attempts = 0;
+
+  fs.mkdirSync = function mkdirWithRepeatedReplacement(target, ...args) {
+    if (path.resolve(target) === path.resolve(lock)) {
+      attempts++;
+      if (attempts > 200) throw new Error('stale recovery hot spin exceeded retry bound');
+      realMkdirSync.call(this, target);
+      const old = new Date(Date.now() - 60_000);
+      fs.utimesSync(target, old, old);
+      const err = new Error('replacement lock won the race');
+      err.code = 'EEXIST';
+      throw err;
+    }
+    return realMkdirSync.call(this, target, ...args);
+  };
+
+  const startedAt = Date.now();
+  try {
+    await assert.rejects(
+      historyModule.updateHistory(
+        file,
+        commandKey(['make']),
+        { durationSeconds: 1, total: null, finishedAt: 't1', exitCode: 0 },
+        { timeoutMs: 20, retryMs: 2, staleMs: 0 },
+      ),
+      /Timed out waiting for history lock/,
+    );
+  } finally {
+    fs.mkdirSync = realMkdirSync;
+    fs.rmSync(lock, { recursive: true, force: true });
+  }
+
+  assert.ok(attempts > 1, 'replacement locks should be retried');
+  assert.ok(attempts < 200, 'repeated stale recovery must not hot spin');
+  assert.ok(Date.now() - startedAt < 1000, 'timeout should stay bounded');
+});
+
+test('updateHistory propagates unexpected lock mkdir errors', async () => {
+  const dir = tmpDir();
+  const file = path.join(dir, 'history.json');
+  const lock = historyLockPath(file);
+  const realMkdirSync = fs.mkdirSync;
+  let injected = false;
+
+  fs.mkdirSync = function mkdirWithUnexpectedLockError(target, ...args) {
+    if (!injected && path.resolve(target) === path.resolve(lock)) {
+      injected = true;
+      const err = new Error('unexpected lock mkdir failure');
+      err.code = 'EINVAL';
+      throw err;
+    }
+    return realMkdirSync.call(this, target, ...args);
+  };
+
+  try {
+    await assert.rejects(
+      historyModule.updateHistory(
+        file,
+        commandKey(['make']),
+        { durationSeconds: 1, total: null, finishedAt: 't1', exitCode: 0 },
+        { timeoutMs: 1000, retryMs: 1, staleMs: 60_000 },
+      ),
+      /unexpected lock mkdir failure/,
+    );
+  } finally {
+    fs.mkdirSync = realMkdirSync;
+  }
+
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(lock), false);
+});
+
 test('updateHistory stale holder fails without removing a replacement lock after takeover', async () => {
   const dir = tmpDir();
   const file = path.join(dir, 'history.json');
