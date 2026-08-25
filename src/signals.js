@@ -12,7 +12,7 @@ export function createTracker(opts = {}) {
 
   function observe(counters, t) {
     for (const c of counters) {
-      if ((c.kind === 'fraction' || c.kind === 'of') && wantTotal !== null && c.total !== wantTotal) continue;
+      if (wantTotal !== null && c.total !== wantTotal) continue;
       if (wantLabel !== null && c.label !== wantLabel) continue;
       const key = `${c.kind}:${c.label}:${c.total}`;
       let s = signals.get(key);

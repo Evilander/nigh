@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { statusText, createStatusLine } from '../src/render.js';
+import { createStatusLine, normalizeColor, normalizeColorMode, statusText } from '../src/render.js';
 
 function est(overrides = {}) {
   return {
@@ -53,6 +53,79 @@ test('statusText renders the ascii bar form', () => {
     text,
     'nigh [#######---------] 42% · 3m10s left (2m40s-4m00s) · 1m20s elapsed · files 51/120',
   );
+});
+
+test('statusText colors filled and unfilled cells independently', () => {
+  const text = statusText({
+    fraction: 0.25,
+    est: est({ fraction: 0.25 }),
+    label: 'files',
+    value: 30,
+    total: 120,
+    barColor: 'cyan',
+    trackColor: 'bright-black',
+    colorEnabled: true,
+  });
+  assert.equal(
+    text,
+    'nigh ▕\x1b[36m████\x1b[0m\x1b[90m░░░░░░░░░░░░\x1b[0m▏ 25% · 3m10s left (2m40s-4m00s) · 1m20s elapsed · files 30/120',
+  );
+});
+
+test('statusText supports RGB colors and ASCII bars without coloring metadata', () => {
+  const text = statusText({
+    fraction: 0.5,
+    est: est({ fraction: 0.5 }),
+    label: '',
+    value: 1,
+    total: 2,
+    ascii: true,
+    barColor: '#123456',
+    trackColor: 'yellow',
+    colorEnabled: true,
+  });
+  assert.match(text, /^nigh \[\x1b\[38;2;18;52;86m#{8}\x1b\[0m\x1b\[33m-{8}\x1b\[0m\] 50% ·/);
+  assert.doesNotMatch(text.slice(text.indexOf('50%')), /\x1b\[/);
+});
+
+test('statusText leaves output unchanged when color is disabled or there is no bar', () => {
+  const disabled = statusText({
+    fraction: 0.42,
+    est: est(),
+    label: 'files',
+    value: 51,
+    total: 120,
+    barColor: 'cyan',
+    trackColor: 'bright-black',
+    colorEnabled: false,
+  });
+  assert.equal(
+    disabled,
+    'nigh ▕███████░░░░░░░░░▏ 42% · 3m10s left (2m40s-4m00s) · 1m20s elapsed · files 51/120',
+  );
+
+  const noBar = statusText({
+    fraction: null,
+    est: est({ fraction: null, etaSeconds: null, lowSeconds: null, highSeconds: null, basis: 'none' }),
+    barColor: 'cyan',
+    trackColor: 'red',
+    colorEnabled: true,
+  });
+  assert.doesNotMatch(noBar, /\x1b\[/);
+});
+
+test('normalizeColor accepts named, aliased, RGB, and disabled colors', () => {
+  assert.equal(normalizeColor('CYAN'), 'cyan');
+  assert.equal(normalizeColor('grey'), 'bright-black');
+  assert.equal(normalizeColor('#A1B2C3'), '#a1b2c3');
+  assert.equal(normalizeColor('none'), 'none');
+  assert.throws(() => normalizeColor('ultraviolet', '--bar-color'), /--bar-color.*ultraviolet/);
+});
+
+test('normalizeColorMode accepts only auto, always, or never', () => {
+  assert.equal(normalizeColorMode('ALWAYS'), 'always');
+  assert.equal(normalizeColorMode(undefined), 'auto');
+  assert.throws(() => normalizeColorMode('sometimes'), /--color.*sometimes/);
 });
 
 test('statusText clamps an out-of-range fraction instead of throwing', () => {

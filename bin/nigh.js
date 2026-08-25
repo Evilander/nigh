@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // CLI entry: parse flags, then hand the remaining argv off to run().
-import { readFileSync, mkdirSync, createWriteStream } from 'node:fs';
+import { readFileSync, mkdirSync, createWriteStream, openSync, fstatSync, writeSync } from 'node:fs';
+import { isatty } from 'node:tty';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { normalizeColor, normalizeColorMode } from '../src/render.js';
 import { run } from '../src/run.js';
 
 const HELP = `usage: nigh [options] [--] <command> [args...]
@@ -22,6 +24,10 @@ Options:
   --total N            force the primary counter's total to N (must be > 0)
   --label NAME         only track counters labeled NAME (case-insensitive)
   --ascii              draw the progress bar with plain ASCII characters
+  --bar-color COLOR    color for filled progress bar cells (name, #RRGGBB, or none)
+  --track-color COLOR  color for unfilled progress bar cells (name, #RRGGBB, or none)
+  --color auto|always|never
+                        when to emit ANSI color in the status line (default auto)
   --version             print the version and exit
   --help                print this help and exit
 
@@ -62,6 +68,27 @@ function parseArgs(argv) {
       case '--ascii':
         opts.ascii = true;
         break;
+      case '--bar-color': {
+        const value = argv[i + 1];
+        if (value === undefined) return { error: '--bar-color requires a COLOR value' };
+        opts.barColor = value;
+        i += 1;
+        break;
+      }
+      case '--track-color': {
+        const value = argv[i + 1];
+        if (value === undefined) return { error: '--track-color requires a COLOR value' };
+        opts.trackColor = value;
+        i += 1;
+        break;
+      }
+      case '--color': {
+        const value = argv[i + 1];
+        if (value === undefined) return { error: '--color requires auto, always, or never' };
+        opts.colorMode = value;
+        i += 1;
+        break;
+      }
       case '--version':
         opts.version = true;
         break;
@@ -119,9 +146,49 @@ function parseArgs(argv) {
   return { opts, command: argv.slice(i) };
 }
 
+function applyEnvDefaultsAndValidate(opts, env) {
+  try {
+    const barColor = opts.barColor ?? env.NIGH_BAR_COLOR;
+    if (barColor !== undefined) opts.barColor = normalizeColor(barColor, '--bar-color');
+
+    const trackColor = opts.trackColor ?? env.NIGH_TRACK_COLOR;
+    if (trackColor !== undefined) opts.trackColor = normalizeColor(trackColor, '--track-color');
+
+    const colorMode = opts.colorMode ?? (Object.hasOwn(env, 'NO_COLOR') ? 'never' : undefined);
+    opts.colorMode = normalizeColorMode(colorMode);
+    return null;
+  } catch (err) {
+    return err && err.message ? err.message : String(err);
+  }
+}
+
 function readVersion() {
   const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
   return JSON.parse(readFileSync(pkgPath, 'utf8')).version;
+}
+
+function openStatusFile(file) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  const fd = openSync(file, 'w');
+  return createWriteStream('', { fd, autoClose: true });
+}
+
+function openStatusFd(fd) {
+  fstatSync(fd);
+  // A descriptor can exist but still be read-only. A zero-byte synchronous
+  // write checks its access mode without adding bytes to the destination.
+  writeSync(fd, Buffer.alloc(0));
+  return createWriteStream('', { fd, autoClose: false });
+}
+
+function closeOwnedStatusStream(stream) {
+  return new Promise((resolve) => {
+    if (!stream || stream.destroyed || stream.writableEnded) {
+      resolve();
+      return;
+    }
+    stream.end(resolve);
+  });
 }
 
 async function main() {
@@ -149,10 +216,18 @@ async function main() {
     process.stderr.write('nigh: warning: --experimental bare-counter mode is not implemented yet; ignoring.\n');
   }
 
+  const validationError = applyEnvDefaultsAndValidate(opts, process.env);
+  if (validationError) {
+    usageError(validationError);
+    return;
+  }
+
+  let closeStatusStream = false;
   if (opts.statusFile !== undefined) {
     try {
-      mkdirSync(path.dirname(opts.statusFile), { recursive: true });
-      opts.statusStream = createWriteStream(opts.statusFile);
+      opts.statusStream = openStatusFile(opts.statusFile);
+      opts.statusIsTTY = false;
+      closeStatusStream = true;
     } catch (err) {
       process.stderr.write(`nigh: could not open --status-file ${opts.statusFile}: ${err && err.message ? err.message : err}\n`);
       process.exitCode = 2;
@@ -161,12 +236,15 @@ async function main() {
   } else if (opts.statusFd !== undefined) {
     try {
       // autoClose: false - this fd was handed to us open; it is not ours to close.
-      opts.statusStream = createWriteStream('', { fd: opts.statusFd, autoClose: false });
+      opts.statusStream = openStatusFd(opts.statusFd);
+      opts.statusIsTTY = isatty(opts.statusFd);
     } catch (err) {
       process.stderr.write(`nigh: could not open --status-fd ${opts.statusFd}: ${err && err.message ? err.message : err}\n`);
       process.exitCode = 2;
       return;
     }
+  } else {
+    opts.statusIsTTY = Boolean(process.stderr.isTTY);
   }
 
   try {
@@ -176,10 +254,14 @@ async function main() {
     if (err && err.code === 'ENOENT') {
       process.stderr.write(`nigh: command not found: ${command[0]}\n`);
       process.exitCode = 127;
+    } else if (err && err.code === 'NIGH_USAGE') {
+      usageError(err.message);
     } else {
       process.stderr.write(`nigh: ${err && err.message ? err.message : err}\n`);
       process.exitCode = 1;
     }
+  } finally {
+    if (closeStatusStream) await closeOwnedStatusStream(opts.statusStream);
   }
 }
 

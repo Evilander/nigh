@@ -110,7 +110,7 @@ const SHORT_TOK = /^\d{1,2}$/;
 function fractionFrom(line, m) {
   const value = plainNumber(m[1]);
   const total = plainNumber(m[2]);
-  if (!(total > 0) || value > total) return null;
+  if (!Number.isSafeInteger(value) || !Number.isSafeInteger(total) || !(total > 0) || value > total) return null;
   const before = m.index > 0 ? line[m.index - 1] : '';
   if (/[A-Za-z./\\]/.test(before)) return null; // version "v1/2", decimal "1.5/2", or a path segment
   const rest = line.slice(m.index + m[0].length);
@@ -125,7 +125,7 @@ function fractionFrom(line, m) {
 function ofFrom(m) {
   const value = plainNumber(m[1]);
   const total = plainNumber(m[2]);
-  if (!(total > 0) || value > total) return null;
+  if (!Number.isSafeInteger(value) || !Number.isSafeInteger(total) || !(total > 0) || value > total) return null;
   return { start: m.index, end: m.index + m[0].length, kind: 'of', value, total };
 }
 

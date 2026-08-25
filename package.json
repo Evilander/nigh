@@ -1,7 +1,16 @@
 {
   "name": "@evilander/nigh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run any command and get an honest ETA from what it already prints.",
+  "author": "Tyler Eveland",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/evilander/nigh.git"
+  },
+  "homepage": "https://github.com/evilander/nigh#readme",
+  "bugs": {
+    "url": "https://github.com/evilander/nigh/issues"
+  },
   "type": "module",
   "bin": {
     "nigh": "bin/nigh.js"

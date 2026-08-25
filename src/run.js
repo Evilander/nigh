@@ -5,28 +5,39 @@ import os from 'node:os';
 import { createLineSplitter, extractCounters } from './parse.js';
 import { createTracker } from './signals.js';
 import { estimate, formatDuration } from './estimate.js';
-import { createStatusLine, statusText } from './render.js';
-import { commandKey, defaultHistoryPath, loadHistory, recordRun, prior as historyPrior, saveHistory } from './history.js';
+import { createStatusLine, normalizeColor, normalizeColorMode, statusText } from './render.js';
+import { commandKey, defaultHistoryPath, loadHistory, prior as historyPrior, updateHistory } from './history.js';
 
 const DEFAULT_TICK_MS = 500;
+const FORCE_KILL_AFTER_MS = 1000;
 
 // A .cmd/.bat file is not directly executable at the Win32 API level;
 // spawning one without `shell: true` throws synchronously (EINVAL). Using
-// `shell: true` instead would concatenate argv into a shell string, which
-// Node's own deprecation warning flags as unsafe for arbitrary arguments -
-// exactly what a wrapped command's own args can be. Routing through
-// `cmd.exe /d /s /c` keeps args as a normal array (Node still quotes each
-// one for the Windows command line) while resolving the .cmd/.bat target;
-// `/d` skips registry AutoRun commands, `/s` fixes cmd's quote-stripping
-// so an argument that itself starts and ends with a quote survives intact.
+// `shell: true` instead would concatenate argv into an unsafe shell string.
+// Batch files still have to pass through cmd.exe, so quote and escape every
+// token for cmd's parser and pass the finished command line verbatim.
 function isWindowsScript(file) {
   return /\.(cmd|bat)$/i.test(file);
+}
+
+function quoteCmdToken(value) {
+  const text = String(value);
+  if (/[\r\n]/.test(text)) {
+    const err = new TypeError('newlines are not supported in .cmd/.bat arguments');
+    err.code = 'NIGH_USAGE';
+    throw err;
+  }
+  return `"${text.replace(/[\^&|<>()"%!]/g, '^$&')}"`;
 }
 
 function spawnMaybeScript(file, args, spawnOptions) {
   if (process.platform === 'win32' && isWindowsScript(file)) {
     const comspec = process.env.ComSpec || 'cmd.exe';
-    return spawn(comspec, ['/d', '/s', '/c', file, ...args], spawnOptions);
+    const commandLine = `"${[file, ...args].map(quoteCmdToken).join(' ')}"`;
+    return spawn(comspec, ['/d', '/v:off', '/s', '/c', commandLine], {
+      ...spawnOptions,
+      windowsVerbatimArguments: true,
+    });
   }
   return spawn(file, args, spawnOptions);
 }
@@ -84,8 +95,8 @@ function spawnWithRetry(file, args, spawnOptions) {
 export function killTree(child, signal) {
   if (process.platform === 'win32') {
     try {
-      spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true });
-      return;
+      const result = spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true });
+      if (!result.error && result.status === 0) return;
     } catch {
       // taskkill itself unavailable: fall through to a direct kill below.
     }
@@ -104,6 +115,15 @@ export function killTree(child, signal) {
   }
 }
 
+function scheduleForceKill(child) {
+  if (process.platform === 'win32') return null;
+  const timer = setTimeout(() => {
+    killTree(child, 'SIGKILL');
+  }, FORCE_KILL_AFTER_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
 // Wraps a destination Writable so that (1) EPIPE and other destination
 // errors are swallowed instead of crashing the process - once one happens,
 // further writes to that destination are silently dropped rather than
@@ -116,6 +136,13 @@ export function createSink(destStream, source, onBroken) {
   function markBroken() {
     if (broken) return;
     broken = true;
+    if (source && typeof source.isPaused === 'function' && source.isPaused()) {
+      try {
+        source.resume();
+      } catch {
+        // The destination is already broken; resuming is best-effort cleanup.
+      }
+    }
     if (onBroken) onBroken();
   }
   // destStream is documented as a Writable, but tests commonly pass a
@@ -169,6 +196,10 @@ export async function run(argv, opts = {}) {
     total = null,
     label = null,
     ascii = false,
+    barColor,
+    trackColor,
+    colorMode,
+    statusIsTTY,
     stdout = process.stdout,
     stderr = process.stderr,
     statusStream = null,
@@ -176,6 +207,9 @@ export async function run(argv, opts = {}) {
     env,
   } = opts;
 
+  const normalizedBarColor = normalizeColor(barColor, '--bar-color');
+  const normalizedTrackColor = normalizeColor(trackColor, '--track-color');
+  const normalizedColorMode = normalizeColorMode(colorMode);
   const startMs = now();
   const tracker = createTracker({ experimental, total, label });
 
@@ -191,6 +225,25 @@ export async function run(argv, opts = {}) {
     env: env ?? process.env,
   });
 
+  let pipeBroke = false;
+  let forceKillTimer = null;
+  function requestChildTermination(signal) {
+    killTree(child, signal);
+    if ((signal === 'SIGINT' || signal === 'SIGTERM') && forceKillTimer === null) {
+      forceKillTimer = scheduleForceKill(child);
+    }
+  }
+  function markChildPipeBroken() {
+    pipeBroke = true;
+    requestChildTermination('SIGTERM');
+  }
+  function clearForceKillTimer() {
+    if (forceKillTimer !== null) {
+      clearTimeout(forceKillTimer);
+      forceKillTimer = null;
+    }
+  }
+
   // Where nigh's own output (status line, JSON events, the final summary)
   // goes. By default that's stderr, shared with the child's own stderr
   // bytes; statusStream (bin/nigh.js's --status-fd / --status-file) gives
@@ -200,8 +253,14 @@ export async function run(argv, opts = {}) {
   // child-related flows through the status destination, so there is
   // nothing to pause there.
   const statusDest = statusStream ?? stderr;
-  const writeStatus = createSink(statusDest, statusStream ? null : child.stderr);
-  const statusLine = json ? null : createStatusLine({ write: writeStatus }, { isTTY: Boolean(statusDest.isTTY), intervalMs, now });
+  const writeStatus = createSink(
+    statusDest,
+    statusStream ? null : child.stderr,
+    statusStream ? null : markChildPipeBroken,
+  );
+  const statusTTY = statusIsTTY === undefined ? Boolean(statusDest.isTTY) : Boolean(statusIsTTY);
+  const statusLine = json ? null : createStatusLine({ write: writeStatus }, { isTTY: statusTTY, intervalMs, now });
+  const colorEnabled = !json && (normalizedColorMode === 'always' || (normalizedColorMode === 'auto' && statusTTY));
 
   function writeJsonEvent(obj) {
     writeStatus(`${JSON.stringify(obj)}\n`);
@@ -216,8 +275,10 @@ export async function run(argv, opts = {}) {
     for (const line of lines) {
       const counters = extractCounters(line);
       if (counters.length === 0) continue;
+      const hadSignals = tracker.all().length > 0;
       tracker.observe(counters, t);
       if (json) writeJsonEvent({ event: 'counter', line, counters, t: t - startMs });
+      if (!hadSignals && tracker.all().length > 0) tick();
     }
   }
 
@@ -225,10 +286,8 @@ export async function run(argv, opts = {}) {
   // Without this the child keeps producing into a pipe nigh alone still drains,
   // so the pipeline never ends - a plain `cmd | head -1` would have died of
   // SIGPIPE immediately. Stop the child tree and report the conventional 141.
-  let stdoutBroke = false;
   const writeStdout = createSink(stdout, child.stdout, () => {
-    stdoutBroke = true;
-    killTree(child, 'SIGTERM');
+    markChildPipeBroken();
   });
   child.stdout.on('data', (chunk) => {
     writeStdout(chunk);
@@ -238,7 +297,7 @@ export async function run(argv, opts = {}) {
   // Raw stderr sink: only needed when statusStream keeps the status channel
   // separate, so the child's own bytes go straight through instead of via
   // the status line's clear/redraw dance.
-  const writeStderrRaw = statusStream ? createSink(stderr, child.stderr) : null;
+  const writeStderrRaw = statusStream ? createSink(stderr, child.stderr, markChildPipeBroken) : null;
   child.stderr.on('data', (chunk) => {
     if (writeStderrRaw) writeStderrRaw(chunk);
     else if (statusLine) statusLine.passthrough(chunk);
@@ -274,21 +333,29 @@ export async function run(argv, opts = {}) {
       value: primary ? primary.last.value : null,
       total: primary ? primary.total : null,
       ascii,
+      barColor: normalizedBarColor,
+      trackColor: normalizedTrackColor,
+      colorEnabled,
     });
     statusLine.update(text);
   }
   const timer = setInterval(tick, tickMs);
 
-  const forwarded = ['SIGINT', 'SIGTERM'];
-  const signalHandlers = forwarded.map((sig) => {
-    const handler = () => killTree(child, sig);
+  const handledSignals = ['SIGINT', 'SIGTERM'];
+  let receivedSignal = null;
+  const signalHandlers = handledSignals.map((sig) => {
+    const handler = () => {
+      receivedSignal = sig;
+      requestChildTermination(sig);
+    };
     process.on(sig, handler);
     return [sig, handler];
   });
 
   return new Promise((resolve) => {
-    child.once('close', (code, signal) => {
+    child.once('close', async (code, signal) => {
       clearInterval(timer);
+      clearForceKillTimer();
       for (const [sig, handler] of signalHandlers) process.removeListener(sig, handler);
 
       const finishedMs = now();
@@ -302,9 +369,10 @@ export async function run(argv, opts = {}) {
       const durationSeconds = Math.max(0, (finishedMs - startMs) / 1000);
       // 141 is the conventional "died of SIGPIPE" status; Windows has no
       // SIGPIPE in os.constants, so the number is spelled out.
-      const exitCode = stdoutBroke
+      const exitCode = pipeBroke
         ? 141
-        : signal ? 128 + (os.constants.signals[signal] ?? 0) : (code ?? 0);
+        : receivedSignal ? 128 + (os.constants.signals[receivedSignal] ?? 0)
+          : signal ? 128 + (os.constants.signals[signal] ?? 0) : (code ?? 0);
       const primary = tracker.primary();
       const finalEstimate = estimate(primary, finishedMs, startMs, priorEstimate);
 
@@ -316,18 +384,12 @@ export async function run(argv, opts = {}) {
 
       if (historyEnabled) {
         try {
-          // Reload fresh right before merging: another nigh process racing
-          // on the same history file may have saved its own run since this
-          // one started, and merging into that stale in-memory copy instead
-          // would silently drop it.
-          const fresh = loadHistory(historyPath);
-          const updated = recordRun(fresh, key, {
+          await updateHistory(historyPath, key, {
             durationSeconds,
             total: primary ? primary.total : null,
             finishedAt: new Date().toISOString(),
             exitCode,
           });
-          saveHistory(updated, historyPath);
         } catch {
           // history is a convenience, not a correctness requirement: a
           // write failure (e.g. a read-only home dir) must not fail the run.

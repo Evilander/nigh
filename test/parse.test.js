@@ -153,6 +153,11 @@ test('percent counters allow decimals and a space before the sign, total is 100'
   ]);
 });
 
+test('integer counters outside JavaScript safe-integer range are ignored', () => {
+  assert.deepEqual(extractCounters('9007199254740993/9007199254740994'), []);
+  assert.deepEqual(extractCounters('1 of 999999999999999999999999999999999999'), []);
+});
+
 test('several counters in one line come back in line order', () => {
   const counters = extractCounters('1/4 then 50% then 2 of 5');
   assert.deepEqual(counters.map((c) => c.kind), ['fraction', 'percent', 'of']);

@@ -144,10 +144,10 @@ test('primary stickiness does not apply across separate trackers or before any c
   assert.equal(tracker.primary().key, 'fraction:large:100', 'first call: plain ranking, larger total wins');
 });
 
-test('opts.total ignores fraction/of signals with a different total', () => {
+test('opts.total keeps only counters whose total matches across every kind', () => {
   const tracker = createTracker({ total: 120 });
   tracker.observe([frac(1, 200, 'big'), frac(1, 120, 'good'), pct(50, 'any')], 0);
-  assert.deepEqual(tracker.all().map((s) => s.key), ['fraction:good:120', 'percent:any:100']);
+  assert.deepEqual(tracker.all().map((s) => s.key), ['fraction:good:120']);
 });
 
 test('opts.label keeps only signals carrying that label', () => {
