@@ -421,21 +421,51 @@ test('a broken status-only destination does not stop the child', async () => {
 
 test('killTree terminates the whole process tree, not just the direct child', async () => {
   const pidFile = path.join(os.tmpdir(), `nigh-grandchild-pid-${process.pid}-${Date.now()}.txt`);
+  let child = null;
+  let grandchildPid = null;
   try {
-    const child = spawn(node, [fixture('spawns-grandchild.js'), pidFile], { stdio: 'ignore' });
+    child = spawn(node, [fixture('spawns-grandchild.js'), pidFile], {
+      stdio: 'ignore',
+      detached: process.platform !== 'win32',
+    });
+    const childExit = new Promise((resolve, reject) => {
+      child.once('exit', resolve);
+      child.once('error', reject);
+    });
     for (let i = 0; i < 50 && !fs.existsSync(pidFile); i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     assert.ok(fs.existsSync(pidFile), 'grandchild should have announced its pid');
-    const grandchildPid = Number(fs.readFileSync(pidFile, 'utf8'));
+    grandchildPid = Number(fs.readFileSync(pidFile, 'utf8'));
     assert.ok(pidAlive(grandchildPid), 'grandchild should be alive before killTree');
 
     killTree(child, 'SIGTERM');
-    await new Promise((resolve) => setTimeout(resolve, 500)); // give the OS a moment to reap it
+    let exitTimeout;
+    try {
+      await Promise.race([
+        childExit,
+        new Promise((_, reject) => {
+          exitTimeout = setTimeout(() => reject(new Error('direct child did not exit')), 3000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(exitTimeout);
+    }
+    for (let i = 0; i < 40 && pidAlive(grandchildPid); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
 
     assert.equal(pidAlive(grandchildPid), false, 'grandchild should not survive killTree');
     assert.equal(pidAlive(child.pid), false, 'the direct child should not survive killTree either');
   } finally {
+    if (child && child.exitCode === null && child.signalCode === null) killTree(child, 'SIGKILL');
+    if (Number.isInteger(grandchildPid) && pidAlive(grandchildPid)) {
+      try {
+        process.kill(grandchildPid, 'SIGKILL');
+      } catch {
+        // It exited between the liveness check and the cleanup signal.
+      }
+    }
     fs.rmSync(pidFile, { force: true });
   }
 });

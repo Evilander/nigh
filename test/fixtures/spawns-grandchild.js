@@ -7,6 +7,21 @@ import fs from 'node:fs';
 
 const pidFile = process.argv[2];
 const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+let terminating = false;
+
+grandchild.once('exit', () => {
+  if (terminating) process.exit(0);
+});
+
+// On POSIX, let the direct child reap its grandchild before exiting. Without
+// this, process.kill(pid, 0) can briefly report a dead-but-unreaped zombie as
+// alive on CI runners.
+process.once('SIGTERM', () => {
+  terminating = true;
+  if (grandchild.exitCode !== null || grandchild.signalCode !== null) process.exit(0);
+  setTimeout(() => process.exit(1), 2000).unref();
+});
+
 fs.writeFileSync(pidFile, String(grandchild.pid));
 
 setInterval(() => {}, 1000); // keep this process (the direct child) alive too
