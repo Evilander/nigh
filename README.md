@@ -23,13 +23,13 @@ runs as a rough starting estimate.
 Install the current version directly from GitHub:
 
 ```sh
-npm install --global github:evilander/nigh
+npm install --global github:Evilander/nigh
 ```
 
 Or clone it and create a local global link while developing:
 
 ```sh
-git clone https://github.com/evilander/nigh.git
+git clone https://github.com/Evilander/nigh.git
 cd nigh
 npm link
 ```

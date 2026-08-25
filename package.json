@@ -5,11 +5,11 @@
   "author": "Tyler Eveland",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/evilander/nigh.git"
+    "url": "git+https://github.com/Evilander/nigh.git"
   },
-  "homepage": "https://github.com/evilander/nigh#readme",
+  "homepage": "https://github.com/Evilander/nigh#readme",
   "bugs": {
-    "url": "https://github.com/evilander/nigh/issues"
+    "url": "https://github.com/Evilander/nigh/issues"
   },
   "type": "module",
   "bin": {
